@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">voxaccess</string>
+    <string name="floating_bubble_description">Floating AI Assistant Button</string>
 </resources>
