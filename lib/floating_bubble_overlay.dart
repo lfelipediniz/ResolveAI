@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:flutter_tts/flutter_tts.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
@@ -24,14 +25,18 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
   StreamSubscription<ChatMessage>? _messagesSub;
   StreamSubscription<bool>? _canSendSub;
   StreamSubscription<ChatConnectionStatus>? _statusSub;
+  Future<void> _ttsQueue = Future<void>.value();
 
   Offset _position = Offset.zero;
   bool _positionInitialized = false;
   bool _isDragging = false;
 
   final stt.SpeechToText _speech = stt.SpeechToText();
+  final FlutterTts _tts = FlutterTts();
   bool _speechAvailable = false;
   bool _isListening = false;
+  bool _isSpeaking = false;
+  bool _ttsConfigured = false;
   String _transcribedText = '';
   String? _errorMessage;
   String? _lastIncomingText;
@@ -43,6 +48,7 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
   void initState() {
     super.initState();
     _initializeSpeechEngine();
+    unawaited(_configureTextToSpeech());
     _prepareChatSession();
   }
 
@@ -100,9 +106,7 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
     _messagesSub = _chatManager.messagesStream.listen((message) {
       if (!mounted) return;
       if (message.userId != myUserId) {
-        setState(() {
-          _lastIncomingText = message.text;
-        });
+        _ttsQueue = _ttsQueue.then((_) => _handleRemoteMessage(message.text));
       }
     });
 
@@ -111,6 +115,21 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
       _canSendMessage = _chatManager.canSendValue;
       _isPreparingSession = false;
     });
+  }
+
+  Future<void> _configureTextToSpeech() async {
+    try {
+      await _tts.awaitSpeakCompletion(true);
+      await _tts.setLanguage('pt-BR');
+      _ttsConfigured = true;
+    } catch (_) {
+      try {
+        await _tts.setLanguage('en-US');
+        _ttsConfigured = true;
+      } catch (_) {
+        _ttsConfigured = false;
+      }
+    }
   }
 
   void _onSpeechStatus(String status) {
@@ -223,7 +242,8 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
     } catch (error) {
       if (!mounted) return false;
       setState(() {
-        _errorMessage = 'Erro ao conectar ao servidor. Confira sua conexão e tente novamente.';
+        _errorMessage =
+            'Erro ao conectar ao servidor. Confira sua conexão e tente novamente.';
       });
       return false;
     }
@@ -241,7 +261,8 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
       setState(() {
         _transcribedText = '';
         if (sanitized.toLowerCase() == 'done') {
-          _lastIncomingText = 'Conversa encerrada. Toque e segure para iniciar outra sessão';
+          _lastIncomingText =
+              'Conversa encerrada. Toque e segure para iniciar outra sessão';
         } else {
           _lastIncomingText = null;
         }
@@ -264,10 +285,50 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
     }
   }
 
+  Future<void> _handleRemoteMessage(String text) async {
+    final sanitized = text.trim();
+    if (sanitized.isNotEmpty && mounted) {
+      setState(() {
+        _lastIncomingText = sanitized;
+      });
+    }
+
+    if (!_ttsConfigured) {
+      await _configureTextToSpeech();
+    }
+
+    try {
+      if (mounted) {
+        setState(() {
+          _isSpeaking = true;
+        });
+      }
+      await _tts.stop();
+      if (sanitized.isNotEmpty && _ttsConfigured) {
+        await _tts.speak(sanitized);
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _errorMessage ??= 'Falha ao reproduzir a resposta recebida.';
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isSpeaking = false;
+        });
+      }
+      await _chatManager.acknowledgeRemotePlayback();
+    }
+  }
+
   @override
   void dispose() {
     _speech.stop();
     _speech.cancel();
+    _tts.stop();
+    _ttsQueue = Future<void>.value();
     _messagesSub?.cancel();
     _canSendSub?.cancel();
     _statusSub?.cancel();
@@ -318,7 +379,10 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
               ),
               child: Text(
                 _statusLabel(_connectionStatus),
-                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
             ),
           ),
@@ -340,7 +404,10 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
                 child: ClipRRect(
                   borderRadius: BorderRadius.circular(12),
                   child: SingleChildScrollView(
-                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 4,
+                      vertical: 2,
+                    ),
                     child: Text(
                       _transcribedText,
                       textAlign: TextAlign.center,
@@ -355,38 +422,41 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
                 ),
               ),
             ),
-            if (_lastIncomingText != null && _lastIncomingText!.isNotEmpty)
-              Align(
-                alignment: Alignment.bottomCenter,
-                child: Container(
-                  margin: EdgeInsets.only(
-                    left: 16,
-                    right: 16,
-                    bottom: _transcribedText.isNotEmpty ? 120 : 40,
-                  ),
-                  padding: const EdgeInsets.all(14),
-                  decoration: BoxDecoration(
-                    color: Colors.green.withOpacity(0.85),
-                    borderRadius: BorderRadius.circular(16),
-                  ),
-                  width: math.min(screenSize.width - 32, 420),
-                  child: Text(
-                    _lastIncomingText!,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 18,
-                      fontWeight: FontWeight.w500,
-                    ),
+          if (_lastIncomingText != null && _lastIncomingText!.isNotEmpty)
+            Align(
+              alignment: Alignment.bottomCenter,
+              child: Container(
+                margin: EdgeInsets.only(
+                  left: 16,
+                  right: 16,
+                  bottom: _transcribedText.isNotEmpty ? 120 : 40,
+                ),
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: Colors.green.withOpacity(0.85),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                width: math.min(screenSize.width - 32, 420),
+                child: Text(
+                  _lastIncomingText!,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w500,
                   ),
                 ),
               ),
+            ),
           if (_errorMessage != null && _errorMessage!.isNotEmpty)
             Align(
               alignment: Alignment.topCenter,
               child: Container(
                 margin: const EdgeInsets.only(top: 48, left: 24, right: 24),
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 10,
+                ),
                 decoration: BoxDecoration(
                   color: Colors.redAccent,
                   borderRadius: BorderRadius.circular(20),
@@ -396,7 +466,11 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
                   alignment: WrapAlignment.center,
                   spacing: 8,
                   children: [
-                    const Icon(Icons.error_outline, color: Colors.white, size: 18),
+                    const Icon(
+                      Icons.error_outline,
+                      color: Colors.white,
+                      size: 18,
+                    ),
                     Text(
                       _errorMessage!,
                       style: const TextStyle(color: Colors.white),
@@ -450,18 +524,13 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
                     begin: Alignment.topLeft,
                     end: Alignment.bottomRight,
                     colors: _canSendMessage
-                        ? <Color>[
-                            _bubbleColor,
-                            _bubbleColor.withOpacity(0.75),
-                          ]
-                        : <Color>[
-                            Colors.grey.shade600,
-                            Colors.grey.shade400,
-                          ],
+                        ? <Color>[_bubbleColor, _bubbleColor.withOpacity(0.75)]
+                        : <Color>[Colors.grey.shade600, Colors.grey.shade400],
                   ),
                   boxShadow: [
                     BoxShadow(
-                      color: (_canSendMessage ? _bubbleColor : Colors.grey).withOpacity(0.45),
+                      color: (_canSendMessage ? _bubbleColor : Colors.grey)
+                          .withOpacity(0.45),
                       blurRadius: 12,
                       spreadRadius: 2,
                       offset: const Offset(0, 4),
@@ -471,7 +540,11 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
                 child: Icon(
                   _isListening
                       ? Icons.mic
-                      : (_canSendMessage ? Icons.psychology : Icons.lock_clock),
+                      : (_canSendMessage && !_isSpeaking
+                            ? Icons.psychology
+                            : (_isSpeaking
+                                  ? Icons.volume_up
+                                  : Icons.lock_clock)),
                   color: Colors.white,
                   size: 30,
                 ),

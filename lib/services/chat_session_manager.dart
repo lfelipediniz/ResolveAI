@@ -30,11 +30,19 @@ class ChatMessage {
   final int timestamp;
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
+    String? _readString(dynamic value) {
+      if (value == null) return null;
+      if (value is String) return value;
+      return value.toString();
+    }
+
     return ChatMessage(
-      roomId: json['room_id'] as String? ?? '',
-      userId: json['user_id'] as String? ?? '',
-      text: json['text'] as String? ?? '',
-      timestamp: (json['ts'] as num?)?.toInt() ?? 0,
+      roomId: _readString(json['room_id']) ?? _readString(json['roomId']) ?? '',
+      userId: _readString(json['user_id']) ?? _readString(json['userId']) ?? '',
+      text: _readString(json['text']) ?? '',
+      timestamp: (json['ts'] is String)
+          ? int.tryParse(json['ts'] as String) ?? 0
+          : (json['ts'] as num?)?.toInt() ?? 0,
     );
   }
 
@@ -59,7 +67,8 @@ class ChatException implements Exception {
 
 /// Thrown when attempting to send a message without respecting the turn rule.
 class ChatTurnViolationException extends ChatException {
-  const ChatTurnViolationException() : super('Aguarde a resposta antes de enviar outra mensagem.');
+  const ChatTurnViolationException()
+    : super('Aguarde a resposta antes de enviar outra mensagem.');
 }
 
 /// Thrown when a message could not be delivered.
@@ -73,10 +82,14 @@ class ChatSessionManager {
 
   static final ChatSessionManager instance = ChatSessionManager._internal();
 
-  final StreamController<ChatMessage> _messagesController = StreamController<ChatMessage>.broadcast();
-  final StreamController<bool> _canSendController = StreamController<bool>.broadcast();
-  final StreamController<ChatConnectionStatus> _statusController = StreamController<ChatConnectionStatus>.broadcast();
-  final StreamController<Object?> _errorController = StreamController<Object?>.broadcast();
+  final StreamController<ChatMessage> _messagesController =
+      StreamController<ChatMessage>.broadcast();
+  final StreamController<bool> _canSendController =
+      StreamController<bool>.broadcast();
+  final StreamController<ChatConnectionStatus> _statusController =
+      StreamController<ChatConnectionStatus>.broadcast();
+  final StreamController<Object?> _errorController =
+      StreamController<Object?>.broadcast();
 
   final Random _random = Random();
 
@@ -90,6 +103,9 @@ class ChatSessionManager {
   int _retryAttempt = 0;
   ChatConnectionStatus _status = ChatConnectionStatus.disconnected;
   Object? _lastError;
+  int _pendingPlaybackLocks = 0;
+  String? _lastSentMessageText;
+  int? _lastSentTimestampMs;
 
   IOWebSocketChannel? _channel;
   StreamSubscription<dynamic>? _channelSubscription;
@@ -113,7 +129,8 @@ class ChatSessionManager {
   Stream<bool> get canSendStream => _canSendController.stream;
 
   /// Stream that exposes the current connection status.
-  Stream<ChatConnectionStatus> get connectionStatusStream => _statusController.stream;
+  Stream<ChatConnectionStatus> get connectionStatusStream =>
+      _statusController.stream;
 
   /// Stream with raw connection errors for debugging/logging purposes.
   Stream<Object?> get errorsStream => _errorController.stream;
@@ -130,7 +147,9 @@ class ChatSessionManager {
   /// User identifier persisted across installs.
   String get userId {
     if (_userId == null) {
-      throw StateError('ChatSessionManager.initialize() must be called before accessing userId.');
+      throw StateError(
+        'ChatSessionManager.initialize() must be called before accessing userId.',
+      );
     }
     return _userId!;
   }
@@ -189,7 +208,7 @@ class ChatSessionManager {
       throw const ChatSendException('A mensagem não pode ser vazia.');
     }
 
-    if (_awaitingTurn) {
+    if (_awaitingTurn || _pendingPlaybackLocks > 0) {
       throw const ChatTurnViolationException();
     }
 
@@ -208,6 +227,8 @@ class ChatSessionManager {
 
     try {
       _channel!.sink.add(jsonEncode(outgoing.toJson()));
+      _lastSentMessageText = outgoing.text;
+      _lastSentTimestampMs = DateTime.now().millisecondsSinceEpoch;
       _awaitingTurn = true;
       _updateCanSendValue();
     } catch (error) {
@@ -242,14 +263,15 @@ class ChatSessionManager {
 
     _isConnecting = true;
     _updateStatus(ChatConnectionStatus.connecting);
-  final uri = Uri.parse('$_webSocketBaseUrl/${_roomId!}');
+    final uri = Uri.parse('$_webSocketBaseUrl/${_roomId!}');
 
     try {
       final channel = IOWebSocketChannel.connect(uri);
       _channel = channel;
       _channelSubscription = channel.stream.listen(
         _handleIncomingFrame,
-        onError: (Object error, StackTrace stack) => _handleConnectionError(error, stack),
+        onError: (Object error, StackTrace stack) =>
+            _handleConnectionError(error, stack),
         onDone: _handleConnectionClosed,
         cancelOnError: true,
       );
@@ -273,27 +295,43 @@ class ChatSessionManager {
 
   void _handleIncomingFrame(dynamic data) {
     try {
-      final dynamic decoded = data is String ? jsonDecode(data) : data;
-      if (decoded is! Map<String, dynamic>) {
+      final String rawText = data?.toString() ?? '';
+      if (rawText.isEmpty) {
         return;
       }
-      final message = ChatMessage.fromJson(decoded);
+
+      final int now = DateTime.now().millisecondsSinceEpoch;
+      final bool isLikelySelfEcho =
+          _lastSentMessageText != null &&
+          _lastSentTimestampMs != null &&
+          _lastSentMessageText == rawText &&
+          (now - _lastSentTimestampMs!) < 1500;
+
+      final String localUserId = _userId ?? 'local';
+
+      final ChatMessage message = ChatMessage(
+        roomId: _roomId ?? _hardcodedRoomId,
+        userId: isLikelySelfEcho ? localUserId : 'remote',
+        text: rawText,
+        timestamp: now,
+      );
+
       _messagesController.add(message);
 
-      if (message.roomId != _roomId) {
+      if (isLikelySelfEcho) {
+        _awaitingTurn = false;
+        _updateCanSendValue();
         return;
       }
 
-      if (message.userId != _userId) {
-        _awaitingTurn = false;
-        _updateCanSendValue();
+      _awaitingTurn = false;
+      final String normalized = rawText.trim().toLowerCase();
+      if (normalized == 'done') {
+        _clearPlaybackLocks();
+        _finalizeConversationFromRemote();
+        return;
       }
-
-      if (message.text.trim().toLowerCase() == 'done') {
-        if (message.userId != _userId) {
-          _finalizeConversationFromRemote();
-        }
-      }
+      _pushPlaybackLock();
     } catch (error, stackTrace) {
       debugPrint('Erro ao processar mensagem do WebSocket: $error');
       _errorController.add(error);
@@ -303,7 +341,11 @@ class ChatSessionManager {
     }
   }
 
-  void _handleConnectionError(Object error, StackTrace stackTrace, {bool alreadyCompleted = false}) {
+  void _handleConnectionError(
+    Object error,
+    StackTrace stackTrace, {
+    bool alreadyCompleted = false,
+  }) {
     _lastError = error;
     _errorController.add(error);
     _updateStatus(ChatConnectionStatus.error);
@@ -327,6 +369,7 @@ class ChatSessionManager {
     _disposeChannel();
     final shouldAttemptReconnect = _shouldReconnect && _roomId != null;
     _updateStatus(ChatConnectionStatus.disconnected);
+    _pendingPlaybackLocks = 0;
     if (shouldAttemptReconnect) {
       _updateCanSendValue(forceValue: false);
       _scheduleReconnect();
@@ -365,7 +408,10 @@ class ChatSessionManager {
     _updateCanSendValue(forceValue: true);
   }
 
-  Future<void> _closeCurrentConnection({required bool clearRoom, required bool shouldReconnect}) async {
+  Future<void> _closeCurrentConnection({
+    required bool clearRoom,
+    required bool shouldReconnect,
+  }) async {
     _shouldReconnect = shouldReconnect;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
@@ -382,10 +428,11 @@ class ChatSessionManager {
     _disposeChannel();
 
     if (clearRoom) {
-  await _setRoomId(null);
+      await _setRoomId(null);
     }
 
     _awaitingTurn = false;
+    _clearPlaybackLocks();
     _updateStatus(ChatConnectionStatus.disconnected);
     _updateCanSendValue(forceValue: !shouldReconnect);
   }
@@ -410,11 +457,21 @@ class ChatSessionManager {
   }
 
   String _createRoomId() {
-  return _hardcodedRoomId;
+    return _hardcodedRoomId;
+  }
+
+  Future<void> acknowledgeRemotePlayback() async {
+    if (!_initialized) {
+      return;
+    }
+    _releasePlaybackLock();
   }
 
   String _generateUserId() {
-    final suffix = _random.nextInt(0xFFFFFFFF).toRadixString(16).padLeft(8, '0');
+    final suffix = _random
+        .nextInt(0xFFFFFFFF)
+        .toRadixString(16)
+        .padLeft(8, '0');
     return 'user-${DateTime.now().millisecondsSinceEpoch}-$suffix';
   }
 
@@ -433,7 +490,7 @@ class ChatSessionManager {
     } else if (_status != ChatConnectionStatus.connected) {
       nextValue = false;
     } else {
-      nextValue = !_awaitingTurn;
+      nextValue = !_awaitingTurn && _pendingPlaybackLocks == 0;
     }
 
     if (_canSend == nextValue) {
@@ -441,5 +498,29 @@ class ChatSessionManager {
     }
     _canSend = nextValue;
     _canSendController.add(_canSend);
+  }
+
+  void _pushPlaybackLock() {
+    _pendingPlaybackLocks += 1;
+    _updateCanSendValue();
+  }
+
+  void _releasePlaybackLock() {
+    if (_pendingPlaybackLocks == 0) {
+      return;
+    }
+    _pendingPlaybackLocks -= 1;
+    if (_pendingPlaybackLocks < 0) {
+      _pendingPlaybackLocks = 0;
+    }
+    _updateCanSendValue();
+  }
+
+  void _clearPlaybackLocks() {
+    if (_pendingPlaybackLocks == 0) {
+      return;
+    }
+    _pendingPlaybackLocks = 0;
+    _updateCanSendValue();
   }
 }
