@@ -38,6 +38,7 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
   bool _isSpeaking = false;
   bool _ttsConfigured = false;
   String _transcribedText = '';
+  String? _speechLocaleId;
   String? _errorMessage;
   String? _lastIncomingText;
   bool _canSendMessage = false;
@@ -66,6 +67,9 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
           _errorMessage = 'Reconhecimento de voz indisponível.';
         }
       });
+      if (available) {
+        await _selectPreferredLocale();
+      }
     } catch (_) {
       if (!mounted) return;
       setState(() {
@@ -207,10 +211,13 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
           return;
         }
         if (!mounted) return;
-        setState(() {
-          _speechAvailable = true;
-          _errorMessage = null;
-        });
+        if (mounted) {
+          setState(() {
+            _speechAvailable = true;
+            _errorMessage = null;
+          });
+        }
+        await _selectPreferredLocale();
       } catch (_) {
         if (!mounted) return;
         setState(() {
@@ -234,6 +241,7 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
         listenFor: const Duration(minutes: 2),
         partialResults: true,
         cancelOnError: true,
+        localeId: _speechLocaleId,
       );
       if (!mounted) return;
       if (!_speech.isListening) {
@@ -272,6 +280,29 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
     });
     if (!canceled && _transcribedText.isNotEmpty) {
       await _submitCapturedText(_transcribedText);
+    }
+  }
+
+  Future<void> _selectPreferredLocale() async {
+    try {
+      final locales = await _speech.locales();
+      if (locales.isNotEmpty) {
+        final preferred = locales.firstWhere(
+          (locale) => locale.localeId.toLowerCase().startsWith('pt'),
+          orElse: () => locales.first,
+        );
+        _speechLocaleId = preferred.localeId;
+        return;
+      }
+    } catch (_) {
+      // Ignore and attempt system locale below.
+    }
+
+    try {
+      final systemLocale = await _speech.systemLocale();
+      _speechLocaleId = systemLocale?.localeId ?? 'pt_BR';
+    } catch (_) {
+      _speechLocaleId ??= 'pt_BR';
     }
   }
 
