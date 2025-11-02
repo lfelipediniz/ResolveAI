@@ -183,18 +183,24 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
                   color: Colors.black.withOpacity(0.75),
                   borderRadius: BorderRadius.circular(16),
                 ),
+                width: math.min(screenSize.width - 32, 420),
                 constraints: BoxConstraints(
-                  maxWidth: screenSize.width - 32,
-                  maxHeight: screenSize.height * 0.4,
+                  minHeight: 72,
+                  maxHeight: screenSize.height * 0.5,
                 ),
-                child: SingleChildScrollView(
-                  child: Text(
-                    _transcribedText,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 18,
-                      fontWeight: FontWeight.w500,
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                    child: Text(
+                      _transcribedText,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 20,
+                        fontWeight: FontWeight.w500,
+                        height: 1.3,
+                      ),
                     ),
                   ),
                 ),
@@ -231,6 +237,7 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
               child: Container(
                 margin: const EdgeInsets.only(top: 100),
                 padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                width: math.min(screenSize.width - 64, 260),
                 decoration: BoxDecoration(
                   color: _bubbleColor,
                   borderRadius: BorderRadius.circular(24),
@@ -244,6 +251,7 @@ class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
                 ),
                 child: const Row(
                   mainAxisSize: MainAxisSize.min,
+                  mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     Icon(Icons.mic, color: Colors.white),
                     SizedBox(width: 8),
