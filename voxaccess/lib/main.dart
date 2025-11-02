@@ -98,6 +98,17 @@ class _MyHomePageState extends State<MyHomePage> {
       return;
     }
 
+    var micStatus = await Permission.microphone.status;
+    if (!micStatus.isGranted) {
+      micStatus = await Permission.microphone.request();
+      if (!micStatus.isGranted) {
+        setState(() {
+          _statusMessage = 'Permissão de microfone necessária para transcrever sua voz.';
+        });
+        return;
+      }
+    }
+
     if (_isOverlayActive) {
       await FlutterOverlayWindow.closeOverlay();
       setState(() {

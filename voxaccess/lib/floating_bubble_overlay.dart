@@ -2,6 +2,10 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:speech_to_text/speech_recognition_error.dart';
+import 'package:speech_to_text/speech_recognition_result.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 class FloatingBubbleWidget extends StatefulWidget {
   const FloatingBubbleWidget({super.key});
@@ -11,225 +15,315 @@ class FloatingBubbleWidget extends StatefulWidget {
 }
 
 class _FloatingBubbleWidgetState extends State<FloatingBubbleWidget> {
-  bool _showModal = false;
+  final double _bubbleSize = 60;
   final Color _bubbleColor = const Color(0xFF2196F3);
-  bool _isDragging = false;
+
   Offset _position = Offset.zero;
-  final double bubbleSize = 60;
   bool _positionInitialized = false;
+  bool _isDragging = false;
+
+  final stt.SpeechToText _speech = stt.SpeechToText();
+  bool _speechAvailable = false;
+  bool _isListening = false;
+  String _transcribedText = '';
+  String? _errorMessage;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeSpeechEngine();
+  }
+
+  Future<void> _initializeSpeechEngine() async {
+    try {
+      final available = await _speech.initialize(
+        onStatus: _onSpeechStatus,
+        onError: _onSpeechError,
+        debugLogging: false,
+      );
+      if (!mounted) return;
+      setState(() {
+        _speechAvailable = available;
+        if (!available) {
+          _errorMessage = 'Reconhecimento de voz indisponível.';
+        }
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _speechAvailable = false;
+        _errorMessage = 'Erro ao inicializar o microfone.';
+      });
+    }
+  }
+
+  void _onSpeechStatus(String status) {
+    if (!mounted) return;
+    if (status == 'done' || status == 'notListening') {
+      setState(() {
+        _isListening = false;
+      });
+    }
+  }
+
+  void _onSpeechError(SpeechRecognitionError error) {
+    if (!mounted) return;
+    setState(() {
+      _isListening = false;
+      _errorMessage = error.errorMsg;
+    });
+  }
+
+  Future<bool> _ensureMicPermission() async {
+    final status = await Permission.microphone.status;
+    if (status.isGranted) return true;
+    final result = await Permission.microphone.request();
+    if (result.isGranted) return true;
+    if (mounted) {
+      setState(() {
+        _errorMessage = 'Permissão de microfone necessária para gravar áudio.';
+      });
+    }
+    return false;
+  }
+
+  Future<void> _startListening() async {
+    if (_isDragging) return;
+    if (!await _ensureMicPermission()) return;
+
+    if (!_speechAvailable) {
+      await _initializeSpeechEngine();
+      if (!_speechAvailable) return;
+    }
+
+    try {
+      await _speech.stop();
+      await _speech.cancel();
+      await _speech.listen(
+        onResult: _onSpeechResult,
+        listenMode: stt.ListenMode.dictation,
+        pauseFor: const Duration(seconds: 2),
+        listenFor: const Duration(minutes: 1),
+        partialResults: true,
+        cancelOnError: true,
+      );
+      if (!mounted) return;
+      setState(() {
+        _isListening = true;
+        _transcribedText = '';
+        _errorMessage = null;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _isListening = false;
+        _errorMessage = 'Não foi possível iniciar a gravação.';
+      });
+    }
+  }
+
+  Future<void> _stopListening({bool canceled = false}) async {
+    if (_speech.isListening) {
+      if (canceled) {
+        await _speech.cancel();
+      } else {
+        await _speech.stop();
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      _isListening = false;
+    });
+    if (!canceled && _transcribedText.isNotEmpty) {
+      FlutterOverlayWindow.shareData(_transcribedText);
+    }
+  }
+
+  void _onSpeechResult(SpeechRecognitionResult result) {
+    if (!mounted) return;
+    setState(() {
+      _transcribedText = result.recognizedWords;
+    });
+  }
+
+  @override
+  void dispose() {
+    _speech.stop();
+    _speech.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     final Size screenSize = MediaQuery.of(context).size;
-    final double maxX = math.max(0.0, screenSize.width - bubbleSize);
-    final double maxY = math.max(0.0, screenSize.height - bubbleSize);
+    final double maxX = math.max(0.0, screenSize.width - _bubbleSize);
+    final double maxY = math.max(0.0, screenSize.height - _bubbleSize);
 
     if (!_positionInitialized && screenSize != Size.zero) {
       Future.microtask(() {
-        if (mounted) {
-          setState(() {
-            _position = Offset(maxX / 2, maxY / 2);
-            _positionInitialized = true;
-          });
-        }
+        if (!mounted) return;
+        setState(() {
+          _position = Offset(maxX / 2, maxY / 2);
+          _positionInitialized = true;
+        });
       });
     }
-    
+
     return Material(
       color: Colors.transparent,
-      elevation: 0,
       child: Stack(
         children: [
-          // Bubble principal (sempre visível)
-          if (!_showModal)
-            Positioned(
-              top: _position.dy.clamp(0.0, maxY),
-              left: _position.dx.clamp(0.0, maxX),
-              child: GestureDetector(
-                onPanStart: (_) {
-                  setState(() {
-                    _isDragging = true;
-                  });
-                },
-                onPanUpdate: (details) {
-                  setState(() {
-                    // Calcula nova posição
-                    double newX = _position.dx + details.delta.dx;
-                    double newY = _position.dy + details.delta.dy;
-                    
-                    // Aplica limites nas bordas da tela
-                    newX = newX.clamp(0.0, maxX);
-                    newY = newY.clamp(0.0, maxY);
-                    
-                    _position = Offset(newX, newY);
-                  });
-                },
-                onPanEnd: (_) {
-                  Future.delayed(const Duration(milliseconds: 100), () {
-                    if (mounted) {
-                      setState(() {
-                        _isDragging = false;
-                      });
-                    }
-                  });
-                },
-                onTap: () {
-                  if (!_isDragging) {
-                    setState(() {
-                      _showModal = true;
-                    });
-                    FlutterOverlayWindow.shareData('modal_opened');
-                  }
-                },
-                child: Container(
-                  width: bubbleSize,
-                  height: bubbleSize,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    gradient: LinearGradient(
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                      colors: [
-                        _bubbleColor,
-                        _bubbleColor.withOpacity(0.8),
-                      ],
+          if (_transcribedText.isNotEmpty)
+            Align(
+              alignment: Alignment.bottomCenter,
+              child: Container(
+                margin: const EdgeInsets.only(left: 16, right: 16, bottom: 40),
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.75),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                constraints: BoxConstraints(
+                  maxWidth: screenSize.width - 32,
+                  maxHeight: screenSize.height * 0.4,
+                ),
+                child: SingleChildScrollView(
+                  child: Text(
+                    _transcribedText,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.w500,
                     ),
-                    boxShadow: [
-                      BoxShadow(
-                        color: _bubbleColor.withOpacity(0.4),
-                        blurRadius: 12,
-                        spreadRadius: 2,
-                        offset: const Offset(0, 4),
+                  ),
+                ),
+              ),
+            ),
+          if (_errorMessage != null && _errorMessage!.isNotEmpty)
+            Align(
+              alignment: Alignment.topCenter,
+              child: Container(
+                margin: const EdgeInsets.only(top: 48, left: 24, right: 24),
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                decoration: BoxDecoration(
+                  color: Colors.redAccent,
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.error_outline, color: Colors.white, size: 18),
+                    const SizedBox(width: 8),
+                    Flexible(
+                      child: Text(
+                        _errorMessage!,
+                        style: const TextStyle(color: Colors.white),
                       ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          if (_isListening)
+            Align(
+              alignment: Alignment.topCenter,
+              child: Container(
+                margin: const EdgeInsets.only(top: 100),
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                decoration: BoxDecoration(
+                  color: _bubbleColor,
+                  borderRadius: BorderRadius.circular(24),
+                  boxShadow: [
+                    BoxShadow(
+                      color: _bubbleColor.withOpacity(0.45),
+                      blurRadius: 12,
+                      offset: const Offset(0, 4),
+                    ),
+                  ],
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.mic, color: Colors.white),
+                    SizedBox(width: 8),
+                    Text(
+                      'Gravando...',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          Positioned(
+            top: _position.dy.clamp(0.0, maxY),
+            left: _position.dx.clamp(0.0, maxX),
+            child: GestureDetector(
+              onPanStart: (_) {
+                setState(() {
+                  _isDragging = true;
+                  _errorMessage = null;
+                });
+              },
+              onPanUpdate: (details) {
+                setState(() {
+                  double newX = _position.dx + details.delta.dx;
+                  double newY = _position.dy + details.delta.dy;
+                  newX = newX.clamp(0.0, maxX);
+                  newY = newY.clamp(0.0, maxY);
+                  _position = Offset(newX, newY);
+                });
+              },
+              onPanEnd: (_) {
+                Future.delayed(const Duration(milliseconds: 80), () {
+                  if (mounted) {
+                    setState(() {
+                      _isDragging = false;
+                    });
+                  }
+                });
+              },
+              onTap: () {
+                if (_isListening) {
+                  _stopListening();
+                }
+              },
+              onLongPressStart: (_) => _startListening(),
+              onLongPressEnd: (_) => _stopListening(),
+              onLongPressCancel: () => _stopListening(canceled: true),
+              child: Container(
+                width: _bubbleSize,
+                height: _bubbleSize,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [
+                      _bubbleColor,
+                      _bubbleColor.withOpacity(0.75),
                     ],
                   ),
-                  child: const Icon(
-                    Icons.psychology,
-                    color: Colors.white,
-                    size: 32,
-                  ),
-                ),
-              ),
-            ),
-          
-          // Modal em tela cheia
-          if (_showModal && !_isDragging)
-            Positioned.fill(
-              child: GestureDetector(
-                onTap: () {
-                  setState(() {
-                    _showModal = false;
-                  });
-                },
-                child: Container(
-                  color: Colors.black54,
-                  child: Center(
-                    child: GestureDetector(
-                      onTap: () {}, // Previne fechar ao clicar no modal
-                      child: Container(
-                        width: 320,
-                        height: 500,
-                        margin: const EdgeInsets.all(20),
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(24),
-                          boxShadow: [
-                            BoxShadow(
-                              color: Colors.black.withOpacity(0.3),
-                              blurRadius: 20,
-                              spreadRadius: 5,
-                              offset: const Offset(0, 10),
-                            ),
-                          ],
-                        ),
-                        child: Column(
-                          children: [
-                            // Header do modal
-                            Container(
-                              padding: const EdgeInsets.all(16),
-                              decoration: BoxDecoration(
-                                color: _bubbleColor,
-                                borderRadius: const BorderRadius.only(
-                                  topLeft: Radius.circular(24),
-                                  topRight: Radius.circular(24),
-                                ),
-                              ),
-                              child: Row(
-                                children: [
-                                  const Icon(
-                                    Icons.psychology,
-                                    color: Colors.white,
-                                    size: 28,
-                                  ),
-                                  const SizedBox(width: 12),
-                                  const Expanded(
-                                    child: Text(
-                                      'Assistente IA',
-                                      style: TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 20,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                                  ),
-                                  IconButton(
-                                    icon: const Icon(
-                                      Icons.close,
-                                      color: Colors.white,
-                                    ),
-                                    onPressed: () {
-                                      setState(() {
-                                        _showModal = false;
-                                      });
-                                    },
-                                  ),
-                                ],
-                              ),
-                            ),
-                            // Corpo do modal (vazio por enquanto)
-                            const Expanded(
-                              child: Center(
-                                child: Padding(
-                                  padding: EdgeInsets.all(24.0),
-                                  child: Column(
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    children: [
-                                      Icon(
-                                        Icons.construction,
-                                        size: 64,
-                                        color: Colors.grey,
-                                      ),
-                                      SizedBox(height: 16),
-                                      Text(
-                                        'Modal em desenvolvimento',
-                                        style: TextStyle(
-                                          fontSize: 18,
-                                          fontWeight: FontWeight.bold,
-                                          color: Colors.grey,
-                                        ),
-                                      ),
-                                      SizedBox(height: 8),
-                                      Text(
-                                        'Os elementos serão implementados aqui',
-                                        textAlign: TextAlign.center,
-                                        style: TextStyle(
-                                          fontSize: 14,
-                                          color: Colors.grey,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: _bubbleColor.withOpacity(0.45),
+                      blurRadius: 12,
+                      spreadRadius: 2,
+                      offset: const Offset(0, 4),
                     ),
-                  ),
+                  ],
+                ),
+                child: Icon(
+                  _isListening ? Icons.mic : Icons.psychology,
+                  color: Colors.white,
+                  size: 30,
                 ),
               ),
             ),
+          ),
         ],
       ),
     );
